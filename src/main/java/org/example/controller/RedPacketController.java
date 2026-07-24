@@ -6,6 +6,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.*;
 
 import java.math.BigDecimal;
+import java.util.List;
 import java.util.Map;
 
 @RestController
@@ -38,5 +39,12 @@ public class RedPacketController {
     public Result<Map<String, Object>> getRedPacketInfo(@PathVariable Long packetId) {
         Map<String, Object> info = redPacketService.getRedPacketInfo(packetId);
         return Result.success(info);
+    }
+
+    @GetMapping("/list")
+    public Result<List<Map<String, Object>>> getActiveRedPackets(
+            @RequestParam(defaultValue = "20") Integer limit) {
+        List<Map<String, Object>> list = redPacketService.getActiveRedPackets(limit);
+        return Result.success(list);
     }
 }

@@ -227,4 +227,20 @@ public class RedPacketServiceImpl implements RedPacketService {
     private String generateTransactionNo() {
         return UUID.randomUUID().toString().replace("-", "").substring(0, 20);
     }
+
+    @Override
+    public List<Map<String, Object>> getActiveRedPackets(Integer limit) {
+        List<RedPacket> redPackets = redPacketMapper.findActiveRedPackets(limit != null ? limit : 20);
+        return redPackets.stream().map(rp -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("packetId", rp.getId());
+            map.put("totalAmount", rp.getTotalAmount());
+            map.put("totalCount", rp.getTotalCount());
+            map.put("remainAmount", rp.getRemainAmount());
+            map.put("remainCount", rp.getRemainCount());
+            map.put("message", rp.getMessage());
+            map.put("status", rp.getStatus());
+            return map;
+        }).collect(java.util.stream.Collectors.toList());
+    }
 }

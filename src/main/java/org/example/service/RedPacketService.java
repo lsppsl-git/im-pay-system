@@ -1,6 +1,7 @@
 package org.example.service;
 
 import java.math.BigDecimal;
+import java.util.List;
 import java.util.Map;
 
 public interface RedPacketService {
@@ -10,4 +11,6 @@ public interface RedPacketService {
     Map<String, Object> grabRedPacket(Long packetId, Long userId);
 
     Map<String, Object> getRedPacketInfo(Long packetId);
+
+    List<Map<String, Object>> getActiveRedPackets(Integer limit);
 }

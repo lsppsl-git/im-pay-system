@@ -43,6 +43,9 @@
         .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; color: white; }
         .header h1 { font-size: 24px; }
         .login-box { max-width: 400px; margin: 100px auto; }
+        .status-indicator { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+        .status-online { background: #27ae60; }
+        .status-offline { background: #95a5a6; }
     </style>
 </head>
 <body>
@@ -146,11 +149,15 @@
         </div>
     </div>
 
+    <script src="/js/sockjs.min.js"></script>
+    <script src="/js/stomp.min.js"></script>
+
     <script>
-        const BASE_URL = 'http://localhost:8080/api';
+        const BASE_URL = '/api';
         let currentUserId = null;
         let currentUsername = null;
         let currentChatUserId = null;
+        let stompClient = null;
 
         function showRegister() {
             document.getElementById('loginForm').classList.add('hidden');
@@ -221,6 +228,7 @@
                     loadUserList();
                     loadBalance();
                     loadRedPackets();
+                    initWebSocket();
                 } else {
                     document.getElementById('loginError').textContent = data.message;
                 }
@@ -232,6 +240,10 @@
         async function logout() {
             try {
                 await fetch(`${BASE_URL}/users/logout/${currentUserId}`, { method: 'POST' });
+                if (stompClient) {
+                    stompClient.disconnect();
+                    stompClient = null;
+                }
                 location.reload();
             } catch (error) {
                 location.reload();
@@ -259,7 +271,7 @@
                     if (user.id !== currentUserId) {
                         const item = document.createElement('div');
                         item.className = 'user-item ' + (user.isLogin ? 'online' : 'offline');
-                        item.innerHTML = `<strong>${user.nickname || user.username}</strong> (ID: ${user.id})`;
+                        item.innerHTML = `<span class="status-indicator ${user.isLogin ? 'status-online' : 'status-offline'}"></span><strong>${user.nickname || user.username}</strong> (ID: ${user.id})`;
                         item.onclick = () => selectChatUser(user.id, user.nickname || user.username);
                         list.appendChild(item);
                     }
@@ -279,7 +291,7 @@
                 data.data.forEach(user => {
                     const item = document.createElement('div');
                     item.className = 'user-item ' + (user.isLogin ? 'online' : 'offline');
-                    item.innerHTML = `<strong>${user.nickname || user.username}</strong> (ID: ${user.id})`;
+                    item.innerHTML = `<span class="status-indicator ${user.isLogin ? 'status-online' : 'status-offline'}"></span><strong>${user.nickname || user.username}</strong> (ID: ${user.id})`;
                     list.appendChild(item);
                 });
             } catch (error) {
@@ -301,7 +313,7 @@
                 const list = document.getElementById('messageList');
                 list.innerHTML = '';
                 
-                data.data.reverse().forEach(msg => {
+                data.data.forEach(msg => {
                     const item = document.createElement('div');
                     item.className = 'message ' + (msg.fromUserId === currentUserId ? 'sent' : 'received');
                     item.textContent = msg.content;
@@ -315,15 +327,26 @@
 
         async function sendMessage() {
             const content = document.getElementById('messageInput').value.trim();
-            if (!content || !currentChatUserId) return;
+            if (!content) {
+                alert('请输入消息内容');
+                return;
+            }
+            if (!currentChatUserId) {
+                alert('请先选择聊天对象');
+                return;
+            }
 
             try {
+                console.log(`发送消息: ${currentUserId} -> ${currentChatUserId}, content: ${content}`);
                 const response = await fetch(`${BASE_URL}/messages/private/${currentUserId}/${currentChatUserId}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ type: 'TEXT', content })
                 });
+                
+                console.log('响应状态:', response.status);
                 const data = await response.json();
+                console.log('响应数据:', data);
                 
                 if (data.code === 200) {
                     const list = document.getElementById('messageList');
@@ -333,9 +356,85 @@
                     list.appendChild(item);
                     list.scrollTop = list.scrollHeight;
                     document.getElementById('messageInput').value = '';
+                } else {
+                    alert('发送失败: ' + (data.message || '未知错误'));
                 }
             } catch (error) {
                 console.error('发送消息失败:', error);
+                alert('发送失败: ' + error.message);
+            }
+        }
+
+        function initWebSocket() {
+            console.log('=== initWebSocket被调用 ===');
+            console.log('当前用户ID:', currentUserId);
+            console.log('SockJS对象是否存在:', typeof SockJS !== 'undefined');
+            console.log('Stomp对象是否存在:', typeof Stomp !== 'undefined');
+            
+            if (typeof SockJS === 'undefined') {
+                console.error('SockJS未加载，请检查js/sockjs.min.js是否正确引用');
+                return;
+            }
+            if (typeof Stomp === 'undefined') {
+                console.error('Stomp未加载，请检查js/stomp.min.js是否正确引用');
+                return;
+            }
+            
+            if (stompClient) {
+                try {
+                    stompClient.disconnect();
+                } catch (e) {
+                    console.error('断开旧连接失败:', e);
+                }
+                stompClient = null;
+            }
+            
+            try {
+                console.log('创建SockJS连接...');
+                const socket = new SockJS('/ws');
+                console.log('SockJS创建成功:', socket);
+                
+                stompClient = Stomp.over(socket);
+                console.log('Stomp客户端创建成功:', stompClient);
+                
+                stompClient.debug = function(str) {
+                    console.log('STOMP debug:', str);
+                };
+                
+                console.log('开始连接WebSocket...');
+                stompClient.connect({ userId: currentUserId }, function(frame) {
+                    console.log('WebSocket连接成功: ' + frame);
+                    console.log('开始订阅 /topic/user/' + currentUserId);
+                    
+                    stompClient.subscribe('/topic/user/' + currentUserId, function(message) {
+                        try {
+                            console.log('收到原始消息:', message.body);
+                            const msg = JSON.parse(message.body);
+                            console.log('收到消息:', msg);
+                            
+                            if (Number(msg.toUserId) === Number(currentUserId)) {
+                                const list = document.getElementById('messageList');
+                                if (list && currentChatUserId && Number(msg.fromUserId) === Number(currentChatUserId)) {
+                                    const item = document.createElement('div');
+                                    item.className = 'message received';
+                                    item.textContent = msg.content;
+                                    list.appendChild(item);
+                                    list.scrollTop = list.scrollHeight;
+                                } else if (currentChatUserId === null) {
+                                    alert('收到来自用户 ' + msg.fromUserId + ' 的消息: ' + msg.content);
+                                }
+                            }
+                        } catch (e) {
+                            console.error('解析消息失败:', e);
+                        }
+                    });
+                }, function(error) {
+                    console.error('WebSocket连接失败:', error);
+                    setTimeout(initWebSocket, 5000);
+                });
+            } catch (e) {
+                console.error('initWebSocket执行异常:', e);
+                console.error('异常堆栈:', e.stack);
             }
         }
 
@@ -439,20 +538,19 @@
 
         async function loadRedPackets() {
             try {
-                const response = await fetch(`${BASE_URL}/redpacket/info/2`);
+                const response = await fetch(`${BASE_URL}/redpacket/list`);
                 const data = await response.json();
                 const list = document.getElementById('redPacketList');
                 
-                if (data.code === 200 && data.data) {
-                    const rp = data.data;
-                    list.innerHTML = `
-                        <div class="red-packet-item" onclick="grabRedPacket(${rp.packetId})">
+                if (data.code === 200 && data.data && data.data.length > 0) {
+                    list.innerHTML = data.data.map(rp => `
+                        <div class="red-packet-item ${rp.status !== 'ACTIVE' ? 'grabbed' : ''}" onclick="grabRedPacket(${rp.packetId})">
                             <strong>🧧 ${rp.message || '红包'}</strong>
                             <div>总金额: ¥${rp.totalAmount} | 剩余: ¥${rp.remainAmount}</div>
                             <div>总数: ${rp.totalCount}个 | 剩余: ${rp.remainCount}个</div>
                             <div>状态: ${rp.status === 'ACTIVE' ? '可抢' : (rp.status === 'FINISHED' ? '已抢完' : '已过期')}</div>
                         </div>
-                    `;
+                    `).join('');
                 } else {
                     list.innerHTML = '<p>暂无红包</p>';
                 }
