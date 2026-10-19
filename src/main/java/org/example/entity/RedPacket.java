@@ -39,6 +39,9 @@ public class RedPacket {
 
     private String status;
 
+    /** 乐观锁版本号：每次成功扣减 +1，更新时作为 WHERE 条件防止并发覆盖 */
+    private Integer version;
+
     private LocalDateTime expiredAt;
 
     private LocalDateTime createdAt;

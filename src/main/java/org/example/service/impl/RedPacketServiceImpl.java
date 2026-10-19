@@ -12,7 +12,12 @@ import org.example.mapper.WalletMapper;
 import org.example.service.RedPacketService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
+
+import jakarta.annotation.PostConstruct;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -38,7 +43,22 @@ public class RedPacketServiceImpl implements RedPacketService {
     @Autowired
     private TransactionLogMapper transactionLogMapper;
 
+    @Autowired
+    private PlatformTransactionManager transactionManager;
+
+    /** 每次"读→判→带version更新"必须跑在独立新事务里，否则 RR 隔离级别下重读到的还是旧快照，重试永远失败 */
+    private TransactionTemplate requiresNewTx;
+
+    /** 乐观锁 version 冲突时的最大重试次数 */
+    private static final int MAX_RETRY = 3;
+
     private final Random random = new Random();
+
+    @PostConstruct
+    private void initTx() {
+        requiresNewTx = new TransactionTemplate(transactionManager);
+        requiresNewTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+    }
 
     @Override
     @Transactional(rollbackFor = Exception.class)
@@ -110,62 +130,127 @@ public class RedPacketServiceImpl implements RedPacketService {
         return result;
     }
 
+    /**
+     * 抢红包入口，按 mode 走三种实现：
+     * version（默认）= 乐观锁 version + 冲突重试；
+     * lock = 悲观锁 SELECT ... FOR UPDATE（本系统原实现，保留作对比）；
+     * unsafe = 【仅教学演示】无锁错误写法，用于复现并发超抢
+     */
     @Override
-    @Transactional(rollbackFor = Exception.class)
-    public Map<String, Object> grabRedPacket(Long packetId, Long userId) {
-        RedPacket redPacket = redPacketMapper.findByIdForUpdate(packetId);
-        if (redPacket == null) {
-            throw BusinessException.of(404, "红包不存在");
+    public Map<String, Object> grabRedPacket(Long packetId, Long userId, String mode) {
+        if ("unsafe".equals(mode)) {
+            return requiresNewTx.execute(status -> doGrabUnsafe(packetId, userId));
         }
-
-        if (redPacket.getStatus().equals("FINISHED")) {
-            throw BusinessException.of(400, "红包已被抢完");
+        if ("lock".equals(mode)) {
+            return requiresNewTx.execute(status -> doGrabPessimistic(packetId, userId));
         }
-
-        if (redPacket.getStatus().equals("EXPIRED")) {
-            throw BusinessException.of(400, "红包已过期");
-        }
-
-        if (redPacket.getSenderId().equals(userId)) {
-            throw BusinessException.of(400, "不能抢自己发的红包");
-        }
-
-        RedPacketRecord existingRecord = redPacketRecordMapper.findByPacketAndUser(packetId, userId);
-        if (existingRecord != null) {
-            throw BusinessException.of(400, "你已经抢过这个红包了");
-        }
-
-        if (redPacket.getRemainCount() <= 0) {
-            throw BusinessException.of(400, "红包已被抢完");
-        }
-
-        BigDecimal grabAmount;
-        if (redPacket.getRemainCount() == 1) {
-            grabAmount = redPacket.getRemainAmount();
-        } else if ("FIXED".equals(redPacket.getType())) {
-            grabAmount = redPacket.getTotalAmount()
-                    .divide(new BigDecimal(redPacket.getTotalCount()), 2, RoundingMode.DOWN);
-        } else {
-            BigDecimal minAmount = new BigDecimal("0.01");
-            BigDecimal maxAmount = redPacket.getRemainAmount()
-                    .subtract(minAmount.multiply(new BigDecimal(redPacket.getRemainCount() - 1)))
-                    .multiply(new BigDecimal("2"))
-                    .divide(new BigDecimal(redPacket.getRemainCount()), 2, RoundingMode.DOWN);
-
-            if (maxAmount.compareTo(minAmount) <= 0) {
-                grabAmount = minAmount;
-            } else {
-                double randomValue = random.nextDouble();
-                grabAmount = minAmount.add(maxAmount.subtract(minAmount).multiply(new BigDecimal(randomValue)))
-                        .setScale(2, RoundingMode.DOWN);
+        // 乐观锁：读出版本 → 带 version 条件更新 → 更新 0 行说明被别人改过，重读重试
+        for (int attempt = 1; attempt <= MAX_RETRY; attempt++) {
+            Map<String, Object> result = requiresNewTx.execute(status -> doGrabWithVersion(packetId, userId));
+            if (result != null) {
+                return result;
             }
         }
+        throw BusinessException.of(400, "手慢了，红包已被抢完");
+    }
 
-        int grabRows = redPacketMapper.grab(packetId, grabAmount);
-        if (grabRows == 0) {
+    /** 乐观锁实现：返回 null 表示 version 冲突，交给外层重试 */
+    private Map<String, Object> doGrabWithVersion(Long packetId, Long userId) {
+        // ① 普通读，不加锁；读到的 version 就是本次更新的"凭据"
+        RedPacket redPacket = redPacketMapper.selectById(packetId);
+        BigDecimal grabAmount = validateAndCalcAmount(redPacket, userId);
+
+        // ② 带 version 条件更新：若这行被别人改过，version 已对不上 → 更新 0 行
+        int rows = redPacketMapper.grabWithVersion(packetId, grabAmount, redPacket.getVersion());
+        if (rows == 0) {
+            return null;
+        }
+
+        afterGrabSuccess(packetId, userId, grabAmount);
+        return buildGrabResult(grabAmount);
+    }
+
+    /** 悲观锁实现：SELECT ... FOR UPDATE 持有行锁直到事务结束，并发的抢包请求在读取处排队 */
+    private Map<String, Object> doGrabPessimistic(Long packetId, Long userId) {
+        RedPacket redPacket = redPacketMapper.findByIdForUpdate(packetId);
+        BigDecimal grabAmount = validateAndCalcAmount(redPacket, userId);
+
+        int rows = redPacketMapper.grab(packetId, grabAmount);
+        if (rows == 0) {
             throw BusinessException.of(400, "手慢了，红包已被抢完");
         }
 
+        afterGrabSuccess(packetId, userId, grabAmount);
+        return buildGrabResult(grabAmount);
+    }
+
+    /** 【仅教学演示】无锁错误写法：先查再改，中间无任何保护，并发下必然超抢 */
+    private Map<String, Object> doGrabUnsafe(Long packetId, Long userId) {
+        RedPacket redPacket = redPacketMapper.selectById(packetId);
+        BigDecimal grabAmount = validateAndCalcAmount(redPacket, userId);
+
+        // 故意放大"判断"与"更新"之间的时间窗口，让并发竞争必然发生
+        try {
+            Thread.sleep(100);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+
+        // 无条件 UPDATE：不带 version、不判断剩余，多个请求同时通过上面的 if 就会全部扣减成功
+        redPacketMapper.grabUnsafe(packetId, grabAmount);
+
+        afterGrabSuccess(packetId, userId, grabAmount);
+        return buildGrabResult(grabAmount);
+    }
+
+    /** 公共校验 + 计算本次抢到的金额 */
+    private BigDecimal validateAndCalcAmount(RedPacket redPacket, Long userId) {
+        if (redPacket == null) {
+            throw BusinessException.of(404, "红包不存在");
+        }
+        if ("FINISHED".equals(redPacket.getStatus())) {
+            throw BusinessException.of(400, "红包已被抢完");
+        }
+        if ("EXPIRED".equals(redPacket.getStatus())) {
+            throw BusinessException.of(400, "红包已过期");
+        }
+        if (redPacket.getSenderId().equals(userId)) {
+            throw BusinessException.of(400, "不能抢自己发的红包");
+        }
+        RedPacketRecord existingRecord = redPacketRecordMapper.findByPacketAndUser(redPacket.getId(), userId);
+        if (existingRecord != null) {
+            throw BusinessException.of(400, "你已经抢过这个红包了");
+        }
+        if (redPacket.getRemainCount() <= 0) {
+            throw BusinessException.of(400, "红包已被抢完");
+        }
+        return calcGrabAmount(redPacket);
+    }
+
+    private BigDecimal calcGrabAmount(RedPacket redPacket) {
+        if (redPacket.getRemainCount() == 1) {
+            return redPacket.getRemainAmount();
+        }
+        if ("FIXED".equals(redPacket.getType())) {
+            return redPacket.getTotalAmount()
+                    .divide(new BigDecimal(redPacket.getTotalCount()), 2, RoundingMode.DOWN);
+        }
+        BigDecimal minAmount = new BigDecimal("0.01");
+        BigDecimal maxAmount = redPacket.getRemainAmount()
+                .subtract(minAmount.multiply(new BigDecimal(redPacket.getRemainCount() - 1)))
+                .multiply(new BigDecimal("2"))
+                .divide(new BigDecimal(redPacket.getRemainCount()), 2, RoundingMode.DOWN);
+
+        if (maxAmount.compareTo(minAmount) <= 0) {
+            return minAmount;
+        }
+        double randomValue = random.nextDouble();
+        return minAmount.add(maxAmount.subtract(minAmount).multiply(new BigDecimal(randomValue)))
+                .setScale(2, RoundingMode.DOWN);
+    }
+
+    /** 扣减成功后的收尾：钱包入账 + 写抢包记录 + 剩余为 0 时置 FINISHED */
+    private void afterGrabSuccess(Long packetId, Long userId, BigDecimal grabAmount) {
         Wallet wallet = walletMapper.findByUserIdForUpdate(userId);
         if (wallet == null) {
             wallet = Wallet.builder()
@@ -186,19 +271,19 @@ public class RedPacketServiceImpl implements RedPacketService {
                 .amount(grabAmount)
                 .createdAt(LocalDateTime.now())
                 .build();
-
         redPacketRecordMapper.insert(record);
 
-        redPacket = redPacketMapper.selectById(packetId);
-        if (redPacket.getRemainCount() == 0) {
-            redPacket.setStatus("FINISHED");
-            redPacketMapper.updateById(redPacket);
+        RedPacket latest = redPacketMapper.selectById(packetId);
+        if (latest.getRemainCount() == 0) {
+            latest.setStatus("FINISHED");
+            redPacketMapper.updateById(latest);
         }
+    }
 
+    private Map<String, Object> buildGrabResult(BigDecimal grabAmount) {
         Map<String, Object> result = new HashMap<>();
         result.put("amount", grabAmount);
         result.put("message", "抢红包成功");
-
         return result;
     }
 
@@ -219,6 +304,7 @@ public class RedPacketServiceImpl implements RedPacketService {
         result.put("remainCount", redPacket.getRemainCount());
         result.put("message", redPacket.getMessage());
         result.put("status", redPacket.getStatus());
+        result.put("version", redPacket.getVersion());
         result.put("records", records);
 
         return result;

@@ -8,7 +8,7 @@ public interface RedPacketService {
 
     Map<String, Object> sendRedPacket(Long senderId, BigDecimal totalAmount, Integer totalCount, String message, String type);
 
-    Map<String, Object> grabRedPacket(Long packetId, Long userId);
+    Map<String, Object> grabRedPacket(Long packetId, Long userId, String mode);
 
     Map<String, Object> getRedPacketInfo(Long packetId);
 

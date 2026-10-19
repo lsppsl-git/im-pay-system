@@ -30,8 +30,9 @@ public class RedPacketController {
     @PostMapping("/grab")
     public Result<Map<String, Object>> grabRedPacket(
             @RequestParam Long packetId,
-            @RequestParam Long userId) {
-        Map<String, Object> result = redPacketService.grabRedPacket(packetId, userId);
+            @RequestParam Long userId,
+            @RequestParam(defaultValue = "version") String mode) {
+        Map<String, Object> result = redPacketService.grabRedPacket(packetId, userId, mode);
         return Result.success(result);
     }
 

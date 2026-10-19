@@ -79,3 +79,6 @@ CREATE TABLE IF NOT EXISTS red_packet_record (
     UNIQUE KEY uk_packet_user (red_packet_id, user_id),
     INDEX idx_packet_id (red_packet_id)
 );
+
+-- 2026-10-16 抢红包乐观锁：version 版本号
+ALTER TABLE red_packet ADD COLUMN version INT NOT NULL DEFAULT 0;

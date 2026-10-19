@@ -28,6 +28,21 @@ public class WalletServiceImpl implements WalletService {
     @Override
     @Transactional(rollbackFor = Exception.class)
     public void transfer(Long fromUserId, Long toUserId, BigDecimal amount) {
+        doTransfer(fromUserId, toUserId, amount, false);
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public void transferSafe(Long fromUserId, Long toUserId, BigDecimal amount) {
+        doTransfer(fromUserId, toUserId, amount, true);
+    }
+
+    /**
+     * 转账公共逻辑。唯一区别在加锁顺序：
+     * sortedLocking=false（transfer）：先锁付款方再锁收款方——A→B 与 B→A 并发时交叉持锁，会触发 InnoDB 死锁检测（1213）
+     * sortedLocking=true（transferSafe）：固定按 user_id 升序加锁——所有事务拿锁顺序一致，破坏"持有并等待"死锁条件
+     */
+    private void doTransfer(Long fromUserId, Long toUserId, BigDecimal amount, boolean sortedLocking) {
         if (fromUserId.equals(toUserId)) {
             throw BusinessException.of(400, "不能向自己转账");
         }
@@ -43,7 +58,20 @@ public class WalletServiceImpl implements WalletService {
             return;
         }
 
-        Wallet fromWallet = walletMapper.findByUserIdForUpdate(fromUserId);
+        Wallet fromWallet;
+        Wallet toWallet;
+        if (sortedLocking) {
+            //按账户ID升序统一加锁顺序
+            Wallet first = walletMapper.findByUserIdForUpdate(Math.min(fromUserId, toUserId));
+            Wallet second = walletMapper.findByUserIdForUpdate(Math.max(fromUserId, toUserId));
+            fromWallet = fromUserId < toUserId ? first : second;
+            toWallet = fromUserId < toUserId ? second : first;
+        } else {
+            //按参数顺序加锁（先付款方后收款方）
+            fromWallet = walletMapper.findByUserIdForUpdate(fromUserId);
+            toWallet = walletMapper.findByUserIdForUpdate(toUserId);
+        }
+
         if (fromWallet == null) {
             throw BusinessException.of(404, "付款方钱包不存在");
         }
@@ -52,7 +80,6 @@ public class WalletServiceImpl implements WalletService {
             throw BusinessException.of(400, "余额不足");
         }
 
-        Wallet toWallet = walletMapper.findByUserIdForUpdate(toUserId);
         if (toWallet == null) {
             throw BusinessException.of(404, "收款方钱包不存在");
         }
@@ -74,7 +101,7 @@ public class WalletServiceImpl implements WalletService {
                 .amount(amount)
                 .type("TRANSFER")
                 .status("SUCCESS")
-                .remark("转账")
+                .remark(sortedLocking ? "转账(排序加锁)" : "转账")
                 .createdAt(LocalDateTime.now())
                 .build();
 
